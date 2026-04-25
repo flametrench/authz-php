@@ -1,0 +1,41 @@
+{
+    "name": "flametrench/authz",
+    "description": "Authorization primitives for Flametrench: relational tuples and exact-match check(). Spec-conformant; no rewrite rules in v0.1.",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": ["flametrench", "authorization", "authz", "relational-tuples", "zanzibar"],
+    "homepage": "https://flametrench.dev",
+    "authors": [
+        {
+            "name": "NDC Digital, LLC",
+            "homepage": "https://flametrench.dev"
+        }
+    ],
+    "require": {
+        "php": "^8.3",
+        "flametrench/ids": "^0.1.0"
+    },
+    "require-dev": {
+        "pestphp/pest": "^3.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Flametrench\\Authz\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "vendor/bin/pest"
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}
