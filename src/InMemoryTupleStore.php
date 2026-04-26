@@ -11,11 +11,17 @@ use Flametrench\Authz\Exceptions\DuplicateTupleException;
 use Flametrench\Authz\Exceptions\EmptyRelationSetException;
 use Flametrench\Authz\Exceptions\InvalidFormatException;
 use Flametrench\Authz\Exceptions\TupleNotFoundException;
+use Flametrench\Authz\RewriteRules\Evaluator;
 use Flametrench\Ids\Id;
 
 /**
  * Reference in-memory TupleStore. O(1) check() via secondary natural-key
  * index; deterministic for tests.
+ *
+ * v0.2 adds optional rewrite-rule support. When `$rules` is null
+ * (the default), behavior is byte-identical to v0.1 — a direct
+ * natural-key lookup is the only check path. When rules are provided,
+ * `check()` evaluates them on direct-lookup miss per ADR 0007.
  */
 final class InMemoryTupleStore implements TupleStore
 {
@@ -28,9 +34,28 @@ final class InMemoryTupleStore implements TupleStore
     /** @var callable(): \DateTimeImmutable */
     private $clock;
 
-    public function __construct(?callable $clock = null)
-    {
+    /** @var array<string, array<string, list<\Flametrench\Authz\RewriteRules\RuleNode>>>|null */
+    private ?array $rules;
+
+    private int $maxDepth;
+
+    private int $maxFanOut;
+
+    /**
+     * @param  array<string, array<string, list<\Flametrench\Authz\RewriteRules\RuleNode>>>|null  $rules
+     *   v0.2: optional rewrite rules. With null, the store behaves
+     *   byte-identically to v0.1.
+     */
+    public function __construct(
+        ?callable $clock = null,
+        ?array $rules = null,
+        int $maxDepth = Evaluator::DEFAULT_MAX_DEPTH,
+        int $maxFanOut = Evaluator::DEFAULT_MAX_FAN_OUT,
+    ) {
         $this->clock = $clock ?? static fn(): \DateTimeImmutable => new \DateTimeImmutable();
+        $this->rules = $rules;
+        $this->maxDepth = $maxDepth;
+        $this->maxFanOut = $maxFanOut;
     }
 
     private function now(): \DateTimeImmutable
@@ -137,9 +162,64 @@ final class InMemoryTupleStore implements TupleStore
         string $objectType,
         string $objectId,
     ): CheckResult {
+        // v0.1 fast path: direct natural-key lookup. Returns immediately
+        // on a direct hit regardless of whether rules are registered.
         $key = self::naturalKey($subjectType, $subjectId, $relation, $objectType, $objectId);
         $tupId = $this->keyIndex[$key] ?? null;
-        return new CheckResult(allowed: $tupId !== null, matchedTupleId: $tupId);
+        if ($tupId !== null) {
+            return new CheckResult(allowed: true, matchedTupleId: $tupId);
+        }
+
+        // v0.2 path: rule expansion only on direct miss AND rules registered.
+        if ($this->rules === null) {
+            return new CheckResult(allowed: false, matchedTupleId: null);
+        }
+
+        $result = Evaluator::evaluate(
+            rules: $this->rules,
+            subjectType: $subjectType,
+            subjectId: $subjectId,
+            relation: $relation,
+            objectType: $objectType,
+            objectId: $objectId,
+            directLookup: $this->directLookup(...),
+            listByObject: $this->listByObject(...),
+            maxDepth: $this->maxDepth,
+            maxFanOut: $this->maxFanOut,
+        );
+        return new CheckResult(
+            allowed: $result['allowed'],
+            matchedTupleId: $result['matchedTupleId'],
+        );
+    }
+
+    /** Direct natural-key lookup callback for the rule evaluator. */
+    private function directLookup(
+        string $subjectType,
+        string $subjectId,
+        string $relation,
+        string $objectType,
+        string $objectId,
+    ): ?string {
+        return $this->keyIndex[self::naturalKey($subjectType, $subjectId, $relation, $objectType, $objectId)] ?? null;
+    }
+
+    /**
+     * Enumerate tuples on an object by relation. Used by tuple_to_userset.
+     *
+     * @return iterable<array{0: string, 1: string, 2: string}>
+     */
+    private function listByObject(string $objectType, string $objectId, ?string $relation): iterable
+    {
+        foreach ($this->tuples as $t) {
+            if ($t->objectType !== $objectType || $t->objectId !== $objectId) {
+                continue;
+            }
+            if ($relation !== null && $t->relation !== $relation) {
+                continue;
+            }
+            yield [$t->subjectType, $t->subjectId, $t->id];
+        }
     }
 
     public function checkAny(
@@ -153,9 +233,10 @@ final class InMemoryTupleStore implements TupleStore
             throw new EmptyRelationSetException();
         }
         foreach ($relations as $relation) {
-            $key = self::naturalKey($subjectType, $subjectId, $relation, $objectType, $objectId);
-            if (isset($this->keyIndex[$key])) {
-                return new CheckResult(allowed: true, matchedTupleId: $this->keyIndex[$key]);
+            // Reuse rule-aware check() so checkAny benefits from rewrites.
+            $result = $this->check($subjectType, $subjectId, $relation, $objectType, $objectId);
+            if ($result->allowed) {
+                return $result;
             }
         }
         return new CheckResult(allowed: false, matchedTupleId: null);

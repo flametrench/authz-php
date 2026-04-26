@@ -18,6 +18,10 @@ use Flametrench\Authz\Exceptions\DuplicateTupleException;
 use Flametrench\Authz\Exceptions\EmptyRelationSetException;
 use Flametrench\Authz\Exceptions\InvalidFormatException;
 use Flametrench\Authz\InMemoryTupleStore;
+use Flametrench\Authz\RewriteRules\ComputedUserset;
+use Flametrench\Authz\RewriteRules\RuleNode;
+use Flametrench\Authz\RewriteRules\ThisNode;
+use Flametrench\Authz\RewriteRules\TupleToUserset;
 
 const FIXTURES_DIR = __DIR__ . '/conformance/fixtures';
 
@@ -45,6 +49,46 @@ function errorClassForSpecName(string $name): string
         'InvalidFormatError' => InvalidFormatException::class,
         'EmptyRelationSetError' => EmptyRelationSetException::class,
         default => throw new RuntimeException("Unknown spec error: {$name}"),
+    };
+}
+
+/**
+ * Parse the JSON canonical rule shape into the SDK's typed rule classes.
+ *
+ * @param  array<string, array<string, list<array<string, mixed>>>>|null  $raw
+ * @return array<string, array<string, list<RuleNode>>>|null
+ */
+function parseRulesFromWire(?array $raw): ?array
+{
+    if ($raw === null) {
+        return null;
+    }
+    $out = [];
+    foreach ($raw as $objectType => $relations) {
+        $out[$objectType] = [];
+        foreach ($relations as $relation => $nodes) {
+            $out[$objectType][$relation] = array_map(
+                fn(array $n): RuleNode => parseRuleNode($n),
+                $nodes,
+            );
+        }
+    }
+    return $out;
+}
+
+/**
+ * @param  array<string, mixed>  $node
+ */
+function parseRuleNode(array $node): RuleNode
+{
+    return match ($node['type']) {
+        'this' => new ThisNode(),
+        'computed_userset' => new ComputedUserset(relation: $node['relation']),
+        'tuple_to_userset' => new TupleToUserset(
+            tuplesetRelation: $node['tupleset_relation'],
+            computedUsersetRelation: $node['computed_userset_relation'],
+        ),
+        default => throw new RuntimeException("Unknown rule node type: {$node['type']}"),
     };
 }
 
@@ -194,3 +238,41 @@ describe(
         }
     },
 );
+
+// ─── v0.2: authorization.check with rewrite rules ───
+//
+// Per ADR 0007. Each test optionally declares a `rules` field; the
+// harness instantiates the store with those rules registered before
+// running the check.
+
+foreach (
+    [
+        'authorization/rewrite-rules/computed-userset.json' => 'rewrite · computed_userset',
+        'authorization/rewrite-rules/tuple-to-userset.json' => 'rewrite · tuple_to_userset',
+        'authorization/rewrite-rules/empty-rules-equals-v01.json' => 'rewrite · empty-rules-equals-v01',
+    ] as $fixturePath => $suffix
+) {
+    $fixture = loadAuthzFixture($fixturePath);
+    describe(
+        "Conformance · authorization.check [MUST] · {$suffix}",
+        function () use ($fixture) {
+            foreach ($fixture['tests'] as $t) {
+                it("[{$t['id']}] {$t['description']}", function () use ($t) {
+                    $store = new InMemoryTupleStore(
+                        rules: parseRulesFromWire($t['rules'] ?? null),
+                    );
+                    seedAuthz($store, $t['input']['given_tuples']);
+                    $c = $t['input']['check'];
+                    $result = $store->check(
+                        subjectType: $c['subject_type'],
+                        subjectId: $c['subject_id'],
+                        relation: $c['relation'],
+                        objectType: $c['object_type'],
+                        objectId: $c['object_id'],
+                    );
+                    expect($result->allowed)->toBe($t['expected']['result']['allowed']);
+                });
+            }
+        },
+    );
+}
