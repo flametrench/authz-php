@@ -119,6 +119,36 @@ it('getShare raises ShareNotFoundException for unknown ids', function () {
     $this->store->getShare(Id::generate('shr'));
 })->throws(ShareNotFoundException::class);
 
+it('consumed + expired share raises ShareConsumedException (consumed wins precedence)', function () {
+    $now = new \DateTimeImmutable('2026-04-27T00:00:00Z');
+    $clock = function () use (&$now) { return $now; };
+    $s = new PostgresShareStore($this->pdo, $clock);
+    $r = $s->createShare('proj', $this->project42, 'viewer', $this->alice, 60, singleUse: true);
+    $s->verifyShareToken($r->token); // consumes
+    $now = $now->add(new \DateInterval('PT61S')); // now also expired
+    $s->verifyShareToken($r->token);
+})->throws(ShareConsumedException::class);
+
+it('createdBy round-trips through Postgres encode/decode', function () {
+    $r = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $fetched = $this->store->getShare($r->share->id);
+    expect($fetched->createdBy)->toBe($this->alice);
+    expect($fetched->createdBy)->toStartWith('usr_');
+});
+
+it('listSharesForObject returns active, revoked, and consumed shares', function () {
+    $active = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $revoked = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $consumed = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600, singleUse: true);
+    $this->store->revokeShare($revoked->share->id);
+    $this->store->verifyShareToken($consumed->token);
+    $page = $this->store->listSharesForObject('proj', $this->project42);
+    $ids = array_map(fn($s) => $s->id, $page->data);
+    expect($ids)->toContain($active->share->id);
+    expect($ids)->toContain($revoked->share->id);
+    expect($ids)->toContain($consumed->share->id);
+});
+
 it('listSharesForObject filters by object and paginates', function () {
     $other = Id::decode(Id::generate('usr'))['uuid'];
     foreach ([$this->project42, $this->project42, $other, $this->project42] as $obj) {
