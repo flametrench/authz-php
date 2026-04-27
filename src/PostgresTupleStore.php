@@ -56,6 +56,30 @@ final class PostgresTupleStore implements TupleStore
         return Id::decode($wireId)['uuid'];
     }
 
+    /**
+     * Decode an `object_id` to a Postgres-bindable UUID string.
+     *
+     * `object_type` is application-defined (per spec/docs/authorization.md
+     * and ADR 0001), so `object_id` may legitimately arrive as:
+     *   1. A wire-format ID with a non-registered prefix (e.g. `proj_<hex>`,
+     *      `file_<hex>`) — extract the UUID via `Id::decodeAny` so app-
+     *      defined prefixes are accepted in addition to registered types.
+     *   2. A raw 32-character hex UUID — accept as-is; Postgres UUID
+     *      parsing handles both 32-hex and hyphenated forms.
+     *   3. A canonical hyphenated UUID — also accepted as-is.
+     *
+     * Closes spec#8 (`PostgresTupleStore` previously bound `$objectId`
+     * directly into a UUID column, which crashed when adopters passed
+     * wire-format IDs with app-defined prefixes).
+     */
+    private static function objectIdToUuid(string $objectId): string
+    {
+        if (preg_match('/^[a-z]{2,6}_[0-9a-f]{32}$/', $objectId) === 1) {
+            return Id::decodeAny($objectId)['uuid'];
+        }
+        return $objectId;
+    }
+
     /** @param array<string, mixed> $row */
     private static function rowToTuple(array $row): Tuple
     {
@@ -100,6 +124,7 @@ final class PostgresTupleStore implements TupleStore
         self::validate($relation, $objectType);
         $id = Id::decode(Id::generate('tup'))['uuid'];
         $subjectUuid = self::wireToUuid($subjectId);
+        $objectUuid = self::objectIdToUuid($objectId);
         $createdByUuid = $createdBy !== null ? self::wireToUuid($createdBy) : null;
         $now = $this->now()->format('Y-m-d H:i:s.uP');
         try {
@@ -109,7 +134,7 @@ final class PostgresTupleStore implements TupleStore
                  RETURNING id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by'
             );
             $stmt->execute([
-                $id, $subjectType, $subjectUuid, $relation, $objectType, $objectId, $now, $createdByUuid,
+                $id, $subjectType, $subjectUuid, $relation, $objectType, $objectUuid, $now, $createdByUuid,
             ]);
             /** @var array<string, mixed> $row */
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -121,7 +146,7 @@ final class PostgresTupleStore implements TupleStore
                      WHERE subject_type = ? AND subject_id = ? AND relation = ?
                        AND object_type = ? AND object_id = ?'
                 );
-                $sel->execute([$subjectType, $subjectUuid, $relation, $objectType, $objectId]);
+                $sel->execute([$subjectType, $subjectUuid, $relation, $objectType, $objectUuid]);
                 $existing = $sel->fetch(PDO::FETCH_ASSOC);
                 if ($existing !== false) {
                     throw new DuplicateTupleException(
@@ -183,7 +208,7 @@ final class PostgresTupleStore implements TupleStore
             self::wireToUuid($subjectId),
             '{' . implode(',', array_map(fn(string $r) => '"' . $r . '"', $relations)) . '}',
             $objectType,
-            $objectId,
+            self::objectIdToUuid($objectId),
         ]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if ($row === false) {
@@ -240,7 +265,7 @@ final class PostgresTupleStore implements TupleStore
         int $limit = 50,
     ): Page {
         $limit = min($limit, 200);
-        $params = [$objectType, $objectId];
+        $params = [$objectType, self::objectIdToUuid($objectId)];
         $sql = 'SELECT id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by
                 FROM tup
                 WHERE object_type = ? AND object_id = ?';

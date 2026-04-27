@@ -57,6 +57,18 @@ final class PostgresShareStore implements ShareStore
         return Id::decode($wireId)['uuid'];
     }
 
+    /**
+     * Decode an `object_id` to a Postgres-bindable UUID string.
+     * See PostgresTupleStore::objectIdToUuid for rationale (spec#8).
+     */
+    private static function objectIdToUuid(string $objectId): string
+    {
+        if (preg_match('/^[a-z]{2,6}_[0-9a-f]{32}$/', $objectId) === 1) {
+            return Id::decodeAny($objectId)['uuid'];
+        }
+        return $objectId;
+    }
+
     private static function hashTokenBytes(string $token): string
     {
         return hash('sha256', $token, binary: true);
@@ -169,7 +181,7 @@ final class PostgresShareStore implements ShareStore
         $stmt->bindValue(1, $shareUuid);
         $stmt->bindValue(2, $tokenHash, PDO::PARAM_LOB);
         $stmt->bindValue(3, $objectType);
-        $stmt->bindValue(4, $objectId);
+        $stmt->bindValue(4, self::objectIdToUuid($objectId));
         $stmt->bindValue(5, $relation);
         $stmt->bindValue(6, $createdByUuid);
         $stmt->bindValue(7, self::fmt($expiresAt));
@@ -282,7 +294,7 @@ final class PostgresShareStore implements ShareStore
         int $limit = 50,
     ): Page {
         $limit = min($limit, 200);
-        $params = [$objectType, $objectId];
+        $params = [$objectType, self::objectIdToUuid($objectId)];
         $sql = 'SELECT ' . self::SHR_COLS
             . ' FROM shr WHERE object_type = ? AND object_id = ?';
         if ($cursor !== null) {

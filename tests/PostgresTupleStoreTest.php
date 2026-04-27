@@ -240,6 +240,22 @@ it('listTuplesBySubject paginates', function () {
     expect(count(array_unique($allIds)))->toBe(5);
 });
 
+it('accepts wire-format object_id with an app-defined prefix (proj_<32hex>)', function () {
+    // spec#8: object_type is application-defined per ADR 0001, so
+    // adopters legitimately pass wire-format prefixed IDs (e.g.
+    // `proj_<32hex>`, `file_<32hex>`) at this boundary. Previously this
+    // raised a Postgres UUID parse error.
+    $wireProj = 'proj_' . str_replace('-', '', $this->project42);
+    $t = $this->store->createTuple('usr', $this->alice, 'owner', 'proj', $wireProj);
+    expect($t->id)->toMatch('/^tup_[0-9a-f]{32}$/');
+    // check() and listTuplesByObject() must accept the same wire-format
+    // value back through the read paths.
+    $result = $this->store->check('usr', $this->alice, 'owner', 'proj', $wireProj);
+    expect($result->allowed)->toBeTrue();
+    $listed = $this->store->listTuplesByObject('proj', $wireProj);
+    expect($listed->data)->toHaveCount(1);
+});
+
 /**
  * Convert a postgres:// URL into a PDO connection. Accepts the same
  * forms as libpq (postgres://user:pass@host:port/db).
