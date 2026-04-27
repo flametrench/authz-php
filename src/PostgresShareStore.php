@@ -9,6 +9,7 @@ namespace Flametrench\Authz;
 
 use Flametrench\Authz\Exceptions\InvalidFormatException;
 use Flametrench\Authz\Exceptions\InvalidShareTokenException;
+use Flametrench\Authz\Exceptions\PreconditionException;
 use Flametrench\Authz\Exceptions\ShareConsumedException;
 use Flametrench\Authz\Exceptions\ShareExpiredException;
 use Flametrench\Authz\Exceptions\ShareNotFoundException;
@@ -133,6 +134,27 @@ final class PostgresShareStore implements ShareStore
         bool $singleUse = false,
     ): CreateShareResult {
         self::validate($relation, $objectType, $expiresInSeconds);
+        $createdByUuid = self::wireToUuid($createdBy);
+        // ADR 0012: created_by MUST resolve to an active user. The DDL
+        // FK enforces existence; status is checked here at the SDK
+        // layer. Suspended/revoked users with leaked credentials cannot
+        // mint shares.
+        $check = $this->pdo->prepare('SELECT status FROM usr WHERE id = ?');
+        $check->execute([$createdByUuid]);
+        $userRow = $check->fetch(PDO::FETCH_ASSOC);
+        if ($userRow === false) {
+            throw new PreconditionException(
+                "created_by {$createdBy} does not exist",
+                'creator_not_found',
+            );
+        }
+        if ($userRow['status'] !== 'active') {
+            throw new PreconditionException(
+                "created_by {$createdBy} is {$userRow['status']}; "
+                . 'only active users can mint shares',
+                'creator_not_active',
+            );
+        }
         $shareUuid = Id::decode(Id::generate('shr'))['uuid'];
         $token = self::generateToken();
         $tokenHash = self::hashTokenBytes($token);
@@ -149,7 +171,7 @@ final class PostgresShareStore implements ShareStore
         $stmt->bindValue(3, $objectType);
         $stmt->bindValue(4, $objectId);
         $stmt->bindValue(5, $relation);
-        $stmt->bindValue(6, self::wireToUuid($createdBy));
+        $stmt->bindValue(6, $createdByUuid);
         $stmt->bindValue(7, self::fmt($expiresAt));
         $stmt->bindValue(8, $singleUse, PDO::PARAM_BOOL);
         $stmt->bindValue(9, self::fmt($now));

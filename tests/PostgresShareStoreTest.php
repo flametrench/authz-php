@@ -7,6 +7,7 @@ declare(strict_types=1);
 
 use Flametrench\Authz\Exceptions\InvalidFormatException;
 use Flametrench\Authz\Exceptions\InvalidShareTokenException;
+use Flametrench\Authz\Exceptions\PreconditionException;
 use Flametrench\Authz\Exceptions\ShareConsumedException;
 use Flametrench\Authz\Exceptions\ShareExpiredException;
 use Flametrench\Authz\Exceptions\ShareNotFoundException;
@@ -118,6 +119,25 @@ it('revokeShare raises ShareNotFoundException for unknown ids', function () {
 it('getShare raises ShareNotFoundException for unknown ids', function () {
     $this->store->getShare(Id::generate('shr'));
 })->throws(ShareNotFoundException::class);
+
+// ─── ADR 0012: created_by must be an active user ───
+
+it('rejects createShare when created_by user is suspended', function () {
+    $stmt = $this->pdo->prepare("UPDATE usr SET status = 'suspended' WHERE id = ?");
+    $stmt->execute([Id::decode($this->alice)['uuid']]);
+    $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+})->throws(PreconditionException::class);
+
+it('rejects createShare when created_by user is revoked', function () {
+    $stmt = $this->pdo->prepare("UPDATE usr SET status = 'revoked' WHERE id = ?");
+    $stmt->execute([Id::decode($this->alice)['uuid']]);
+    $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+})->throws(PreconditionException::class);
+
+it('rejects createShare when created_by user does not exist', function () {
+    $ghost = Id::generate('usr');
+    $this->store->createShare('proj', $this->project42, 'viewer', $ghost, 600);
+})->throws(PreconditionException::class);
 
 it('consumed + expired share raises ShareConsumedException (consumed wins precedence)', function () {
     $now = new \DateTimeImmutable('2026-04-27T00:00:00Z');
