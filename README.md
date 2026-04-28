@@ -1,5 +1,7 @@
 # flametrench/authz
 
+[![CI](https://github.com/flametrench/authz-php/actions/workflows/ci.yml/badge.svg)](https://github.com/flametrench/authz-php/actions/workflows/ci.yml)
+
 Authorization primitives for [Flametrench](https://flametrench.dev): relational tuples and exact-match `check()`. Spec-conformant — exact-match remains the default, with **no implicit rewriting** at the API boundary ([ADR 0001](https://github.com/flametrench/spec/blob/main/decisions/0001-authorization-model.md)). v0.2 adds opt-in rewrite rules ([ADR 0007](https://github.com/flametrench/spec/blob/main/decisions/0007-rewrite-rules.md)) — `computed_userset` (role implication) and `tuple_to_userset` (parent-child inheritance) — for adopters who want hierarchies. Group expansion remains deferred.
 
 The PHP counterpart of [`@flametrench/authz`](https://github.com/flametrench/node/tree/main/packages/authz). Same shapes, same invariants, same test fixtures.
