@@ -256,6 +256,56 @@ it('accepts wire-format object_id with an app-defined prefix (proj_<32hex>)', fu
     expect($listed->data)->toHaveCount(1);
 });
 
+// ───── Outer-transaction nesting (ADR 0013) ─────
+
+it('createTuple cooperates with an outer transaction (no nested-BEGIN error)', function () {
+    $this->pdo->beginTransaction();
+    $t = $this->store->createTuple('usr', $this->alice, 'viewer', 'proj', $this->project42);
+    expect($this->pdo->inTransaction())->toBeTrue();
+    $this->pdo->commit();
+    $check = $this->store->check('usr', $this->alice, 'viewer', 'proj', $this->project42);
+    expect($check->allowed)->toBeTrue();
+});
+
+it('rolling back an outer transaction undoes the inner createTuple', function () {
+    $this->pdo->beginTransaction();
+    $this->store->createTuple('usr', $this->alice, 'viewer', 'proj', $this->project42);
+    $this->pdo->rollBack();
+    $check = $this->store->check('usr', $this->alice, 'viewer', 'proj', $this->project42);
+    expect($check->allowed)->toBeFalse();
+});
+
+it('outer transaction can commit a second SDK call after the first one rolls back its savepoint (duplicate tuple)', function () {
+    // Seed a tuple so the next create with the same natural key conflicts.
+    $this->store->createTuple('usr', $this->alice, 'viewer', 'proj', $this->project42);
+
+    $this->pdo->beginTransaction();
+    try {
+        $this->store->createTuple('usr', $this->alice, 'viewer', 'proj', $this->project42);
+        $this->fail('expected DuplicateTupleException');
+    } catch (DuplicateTupleException) {
+        // expected — savepoint rolled back, outer still live
+    }
+
+    // Outer transaction is still usable; another SDK call commits cleanly.
+    $survivor = $this->store->createTuple('usr', $this->bob, 'viewer', 'proj', $this->project42);
+    $this->pdo->commit();
+
+    $check = $this->store->check('usr', $this->bob, 'viewer', 'proj', $this->project42);
+    expect($check->allowed)->toBeTrue();
+    expect($survivor->subjectId)->toBe($this->bob);
+});
+
+it('multiple SDK calls in one outer transaction commit-or-rollback together', function () {
+    $this->pdo->beginTransaction();
+    $this->store->createTuple('usr', $this->alice, 'viewer', 'proj', $this->project42);
+    $this->store->createTuple('usr', $this->bob, 'viewer', 'proj', $this->project99);
+    $this->pdo->rollBack();
+
+    expect($this->store->check('usr', $this->alice, 'viewer', 'proj', $this->project42)->allowed)->toBeFalse();
+    expect($this->store->check('usr', $this->bob, 'viewer', 'proj', $this->project99)->allowed)->toBeFalse();
+});
+
 /**
  * Convert a postgres:// URL into a PDO connection. Accepts the same
  * forms as libpq (postgres://user:pass@host:port/db).

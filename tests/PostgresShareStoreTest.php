@@ -185,6 +185,52 @@ it('listSharesForObject filters by object and paginates', function () {
     expect(count($allIds))->toBe(3);
 });
 
+// ───── Outer-transaction nesting (ADR 0013) ─────
+
+it('createShare cooperates with an outer transaction (no nested-BEGIN error)', function () {
+    $this->pdo->beginTransaction();
+    $r = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    expect($this->pdo->inTransaction())->toBeTrue();
+    $this->pdo->commit();
+    expect($this->store->getShare($r->share->id)->id)->toBe($r->share->id);
+});
+
+it('rolling back an outer transaction undoes the inner createShare', function () {
+    $this->pdo->beginTransaction();
+    $r = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $this->pdo->rollBack();
+    expect(fn() => $this->store->getShare($r->share->id))->toThrow(ShareNotFoundException::class);
+});
+
+it('verifyShareToken cooperates with an outer transaction', function () {
+    // Create the share outside, verify inside the outer txn.
+    $r = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $this->pdo->beginTransaction();
+    $verified = $this->store->verifyShareToken($r->token);
+    expect($this->pdo->inTransaction())->toBeTrue();
+    expect($verified->shareId)->toBe($r->share->id);
+    $this->pdo->commit();
+});
+
+it('outer transaction can commit a second SDK call after the first one rolls back its savepoint (revoked share)', function () {
+    // Seed an active share, revoke it.
+    $r = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $this->store->revokeShare($r->share->id);
+
+    $this->pdo->beginTransaction();
+    try {
+        $this->store->verifyShareToken($r->token);
+        $this->fail('expected ShareRevokedException');
+    } catch (ShareRevokedException) {
+        // expected — savepoint rolled back, outer still live
+    }
+
+    // Outer transaction is still usable; mint a new share inside the same outer.
+    $r2 = $this->store->createShare('proj', $this->project42, 'viewer', $this->alice, 600);
+    $this->pdo->commit();
+    expect($this->store->getShare($r2->share->id)->id)->toBe($r2->share->id);
+});
+
 function sharePgPdoFromUrl(string $url): PDO
 {
     $parts = parse_url($url);

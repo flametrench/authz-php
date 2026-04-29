@@ -13,7 +13,6 @@ use Flametrench\Authz\Exceptions\InvalidFormatException;
 use Flametrench\Authz\Exceptions\TupleNotFoundException;
 use Flametrench\Ids\Id;
 use PDO;
-use PDOException;
 
 /**
  * PostgresTupleStore — Postgres-backed implementation of TupleStore.
@@ -33,6 +32,12 @@ use PDOException;
  *     Rewrite-rule support (ADR 0007) requires the in-memory store with
  *     the `rules` constructor option; bridging the synchronous evaluator
  *     to PDO is tracked for v0.3.
+ *   - Multi-SDK transaction nesting (ADR 0013): when the supplied PDO is
+ *     already inside a transaction at call time, write methods cooperate
+ *     by using SAVEPOINT/RELEASE so a constraint violation from one SDK
+ *     call doesn't poison the outer transaction. Adopters wrapping
+ *     several SDK calls in one outer `DB::transaction(...)` MUST
+ *     construct every participating store with the same `\PDO` instance.
  */
 final class PostgresTupleStore implements TupleStore
 {
@@ -49,6 +54,56 @@ final class PostgresTupleStore implements TupleStore
     private function now(): \DateTimeImmutable
     {
         return ($this->clock)();
+    }
+
+    /**
+     * Run $fn with savepoint shielding when inside an outer transaction, or
+     * unwrapped when standalone (zero overhead). See ADR 0013 — wraps
+     * single-statement writes so a constraint violation rolls back only
+     * the inner statement instead of poisoning the outer transaction
+     * (Postgres SQLSTATE 25P02 on subsequent statements until ROLLBACK).
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function nested(callable $fn): mixed
+    {
+        if (!$this->pdo->inTransaction()) {
+            return $fn();
+        }
+        $savepoint = self::savepointName(self::callerName());
+        $this->pdo->exec('SAVEPOINT ' . $savepoint);
+        try {
+            $result = $fn();
+            $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            return $result;
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo->exec('ROLLBACK TO SAVEPOINT ' . $savepoint);
+                $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            } catch (\Throwable) {
+                // Surface the original error.
+            }
+            throw $e;
+        }
+    }
+
+    /** Read the immediate caller of the function that called this helper. */
+    private static function callerName(): string
+    {
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        return (string) ($bt[2]['function'] ?? 'tx');
+    }
+
+    /** Build a savepoint name matching ADR 0013: `ft_<method>_<random>`. */
+    private static function savepointName(string $method): string
+    {
+        $method = preg_replace('/[^A-Za-z0-9]/', '', $method) ?? '';
+        if ($method === '') {
+            $method = 'tx';
+        }
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
     }
 
     private static function wireToUuid(string $wireId): string
@@ -122,59 +177,81 @@ final class PostgresTupleStore implements TupleStore
         ?string $createdBy = null,
     ): Tuple {
         self::validate($relation, $objectType);
-        $id = Id::decode(Id::generate('tup'))['uuid'];
-        $subjectUuid = self::wireToUuid($subjectId);
-        $objectUuid = self::objectIdToUuid($objectId);
-        $createdByUuid = $createdBy !== null ? self::wireToUuid($createdBy) : null;
-        $now = $this->now()->format('Y-m-d H:i:s.uP');
-        try {
+        return $this->nested(function () use (
+            $subjectType,
+            $subjectId,
+            $relation,
+            $objectType,
+            $objectId,
+            $createdBy,
+        ) {
+            $id = Id::decode(Id::generate('tup'))['uuid'];
+            $subjectUuid = self::wireToUuid($subjectId);
+            $objectUuid = self::objectIdToUuid($objectId);
+            $createdByUuid = $createdBy !== null ? self::wireToUuid($createdBy) : null;
+            $now = $this->now()->format('Y-m-d H:i:s.uP');
+
+            // ON CONFLICT DO NOTHING avoids raising a 23505 inside the
+            // outer transaction (ADR 0013 — see class docblock). When the
+            // natural-key UNIQUE fires, the INSERT returns no rows; we
+            // then read the existing row and raise DuplicateTupleException.
             $stmt = $this->pdo->prepare(
                 'INSERT INTO tup (id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (subject_type, subject_id, relation, object_type, object_id) DO NOTHING
                  RETURNING id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by'
             );
             $stmt->execute([
                 $id, $subjectType, $subjectUuid, $relation, $objectType, $objectUuid, $now, $createdByUuid,
             ]);
-            /** @var array<string, mixed> $row */
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
-            return self::rowToTuple($row);
-        } catch (PDOException $e) {
-            if (self::isUniqueViolation($e)) {
-                $sel = $this->pdo->prepare(
-                    'SELECT id FROM tup
-                     WHERE subject_type = ? AND subject_id = ? AND relation = ?
-                       AND object_type = ? AND object_id = ?'
-                );
-                $sel->execute([$subjectType, $subjectUuid, $relation, $objectType, $objectUuid]);
-                $existing = $sel->fetch(PDO::FETCH_ASSOC);
-                if ($existing !== false) {
-                    throw new DuplicateTupleException(
-                        'Tuple with identical natural key already exists',
-                        Id::encode('tup', (string) $existing['id']),
-                    );
-                }
+            if ($row !== false) {
+                /** @var array<string, mixed> $row */
+                return self::rowToTuple($row);
             }
-            throw $e;
-        }
+            $sel = $this->pdo->prepare(
+                'SELECT id FROM tup
+                 WHERE subject_type = ? AND subject_id = ? AND relation = ?
+                   AND object_type = ? AND object_id = ?'
+            );
+            $sel->execute([$subjectType, $subjectUuid, $relation, $objectType, $objectUuid]);
+            $existing = $sel->fetch(PDO::FETCH_ASSOC);
+            if ($existing === false) {
+                // Race: another connection inserted-and-deleted between our
+                // INSERT-on-conflict and our SELECT. Surface a generic
+                // PDOException-style error so callers can retry.
+                throw new \RuntimeException(
+                    'Tuple natural-key conflict resolved after insert lost the row; retry.',
+                );
+            }
+            throw new DuplicateTupleException(
+                'Tuple with identical natural key already exists',
+                Id::encode('tup', (string) $existing['id']),
+            );
+        });
     }
 
     public function deleteTuple(string $tupleId): void
     {
-        $stmt = $this->pdo->prepare('DELETE FROM tup WHERE id = ?');
-        $stmt->execute([self::wireToUuid($tupleId)]);
-        if ($stmt->rowCount() === 0) {
-            throw new TupleNotFoundException("Tuple {$tupleId} not found");
-        }
+        $this->nested(function () use ($tupleId) {
+            $stmt = $this->pdo->prepare('DELETE FROM tup WHERE id = ?');
+            $stmt->execute([self::wireToUuid($tupleId)]);
+            if ($stmt->rowCount() === 0) {
+                throw new TupleNotFoundException("Tuple {$tupleId} not found");
+            }
+            return null;
+        });
     }
 
     public function cascadeRevokeSubject(string $subjectType, string $subjectId): int
     {
-        $stmt = $this->pdo->prepare(
-            'DELETE FROM tup WHERE subject_type = ? AND subject_id = ?'
-        );
-        $stmt->execute([$subjectType, self::wireToUuid($subjectId)]);
-        return $stmt->rowCount();
+        return $this->nested(function () use ($subjectType, $subjectId) {
+            $stmt = $this->pdo->prepare(
+                'DELETE FROM tup WHERE subject_type = ? AND subject_id = ?'
+            );
+            $stmt->execute([$subjectType, self::wireToUuid($subjectId)]);
+            return $stmt->rowCount();
+        });
     }
 
     public function check(
@@ -299,10 +376,4 @@ final class PostgresTupleStore implements TupleStore
         return new Page(data: $tuples, nextCursor: $next);
     }
 
-    /** Postgres SQLSTATE 23505 = unique_violation. */
-    private static function isUniqueViolation(PDOException $e): bool
-    {
-        return ($e->errorInfo[0] ?? null) === '23505'
-            || str_contains($e->getMessage(), 'SQLSTATE[23505]');
-    }
 }

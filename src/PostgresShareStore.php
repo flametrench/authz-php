@@ -25,6 +25,12 @@ use PDO;
  * Single-use consumption uses `UPDATE ... WHERE consumed_at IS NULL
  * RETURNING ...` so concurrent verifies of a single-use token race-
  * correctly to exactly one success.
+ *
+ * Multi-SDK transaction nesting (ADR 0013): when the supplied PDO is
+ * already inside a transaction at call time, this store cooperates by
+ * using SAVEPOINT/RELEASE instead of opening its own BEGIN. Adopters
+ * wrapping several SDK calls in one outer `DB::transaction(...)` MUST
+ * construct every participating store with the same `\PDO` instance.
  */
 final class PostgresShareStore implements ShareStore
 {
@@ -45,6 +51,93 @@ final class PostgresShareStore implements ShareStore
     private function now(): \DateTimeImmutable
     {
         return ($this->clock)();
+    }
+
+    /**
+     * Run $fn atomically. Opens BEGIN/COMMIT when standalone, or
+     * SAVEPOINT/RELEASE when called inside an outer transaction. See ADR 0013.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function tx(callable $fn): mixed
+    {
+        if ($this->pdo->inTransaction()) {
+            return $this->withSavepoint($fn, self::callerName());
+        }
+        $this->pdo->beginTransaction();
+        try {
+            $result = $fn();
+            $this->pdo->commit();
+            return $result;
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo->rollBack();
+            } catch (\Throwable) {
+                // surface original
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Run $fn shielded by a savepoint when inside an outer transaction, or
+     * unwrapped when standalone (zero overhead). For single-statement methods
+     * that don't need their own BEGIN/COMMIT but must not poison an outer
+     * transaction on a constraint violation. See ADR 0013.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function nested(callable $fn): mixed
+    {
+        if (!$this->pdo->inTransaction()) {
+            return $fn();
+        }
+        return $this->withSavepoint($fn, self::callerName());
+    }
+
+    /**
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function withSavepoint(callable $fn, string $caller): mixed
+    {
+        $savepoint = self::savepointName($caller);
+        $this->pdo->exec('SAVEPOINT ' . $savepoint);
+        try {
+            $result = $fn();
+            $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            return $result;
+        } catch (\Throwable $e) {
+            try {
+                $this->pdo->exec('ROLLBACK TO SAVEPOINT ' . $savepoint);
+                $this->pdo->exec('RELEASE SAVEPOINT ' . $savepoint);
+            } catch (\Throwable) {
+                // Surface the original error.
+            }
+            throw $e;
+        }
+    }
+
+    /** Read the immediate caller of the function that called this helper. */
+    private static function callerName(): string
+    {
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        return (string) ($bt[2]['function'] ?? 'tx');
+    }
+
+    /** Build a savepoint name matching ADR 0013: `ft_<method>_<random>`. */
+    private static function savepointName(string $method): string
+    {
+        $method = preg_replace('/[^A-Za-z0-9]/', '', $method) ?? '';
+        if ($method === '') {
+            $method = 'tx';
+        }
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
     }
 
     private static function fmt(\DateTimeImmutable $dt): string
@@ -146,51 +239,60 @@ final class PostgresShareStore implements ShareStore
         bool $singleUse = false,
     ): CreateShareResult {
         self::validate($relation, $objectType, $expiresInSeconds);
-        $createdByUuid = self::wireToUuid($createdBy);
-        // ADR 0012: created_by MUST resolve to an active user. The DDL
-        // FK enforces existence; status is checked here at the SDK
-        // layer. Suspended/revoked users with leaked credentials cannot
-        // mint shares.
-        $check = $this->pdo->prepare('SELECT status FROM usr WHERE id = ?');
-        $check->execute([$createdByUuid]);
-        $userRow = $check->fetch(PDO::FETCH_ASSOC);
-        if ($userRow === false) {
-            throw new PreconditionException(
-                "created_by {$createdBy} does not exist",
-                'creator_not_found',
+        return $this->nested(function () use (
+            $objectType,
+            $objectId,
+            $relation,
+            $createdBy,
+            $expiresInSeconds,
+            $singleUse,
+        ) {
+            $createdByUuid = self::wireToUuid($createdBy);
+            // ADR 0012: created_by MUST resolve to an active user. The DDL
+            // FK enforces existence; status is checked here at the SDK
+            // layer. Suspended/revoked users with leaked credentials cannot
+            // mint shares.
+            $check = $this->pdo->prepare('SELECT status FROM usr WHERE id = ?');
+            $check->execute([$createdByUuid]);
+            $userRow = $check->fetch(PDO::FETCH_ASSOC);
+            if ($userRow === false) {
+                throw new PreconditionException(
+                    "created_by {$createdBy} does not exist",
+                    'creator_not_found',
+                );
+            }
+            if ($userRow['status'] !== 'active') {
+                throw new PreconditionException(
+                    "created_by {$createdBy} is {$userRow['status']}; "
+                    . 'only active users can mint shares',
+                    'creator_not_active',
+                );
+            }
+            $shareUuid = Id::decode(Id::generate('shr'))['uuid'];
+            $token = self::generateToken();
+            $tokenHash = self::hashTokenBytes($token);
+            $now = $this->now();
+            $expiresAt = $now->add(new \DateInterval('PT' . $expiresInSeconds . 'S'));
+            $stmt = $this->pdo->prepare(
+                'INSERT INTO shr (id, token_hash, object_type, object_id, relation,
+                                  created_by, expires_at, single_use, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 RETURNING ' . self::SHR_COLS,
             );
-        }
-        if ($userRow['status'] !== 'active') {
-            throw new PreconditionException(
-                "created_by {$createdBy} is {$userRow['status']}; "
-                . 'only active users can mint shares',
-                'creator_not_active',
-            );
-        }
-        $shareUuid = Id::decode(Id::generate('shr'))['uuid'];
-        $token = self::generateToken();
-        $tokenHash = self::hashTokenBytes($token);
-        $now = $this->now();
-        $expiresAt = $now->add(new \DateInterval('PT' . $expiresInSeconds . 'S'));
-        $stmt = $this->pdo->prepare(
-            'INSERT INTO shr (id, token_hash, object_type, object_id, relation,
-                              created_by, expires_at, single_use, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             RETURNING ' . self::SHR_COLS,
-        );
-        $stmt->bindValue(1, $shareUuid);
-        $stmt->bindValue(2, $tokenHash, PDO::PARAM_LOB);
-        $stmt->bindValue(3, $objectType);
-        $stmt->bindValue(4, self::objectIdToUuid($objectId));
-        $stmt->bindValue(5, $relation);
-        $stmt->bindValue(6, $createdByUuid);
-        $stmt->bindValue(7, self::fmt($expiresAt));
-        $stmt->bindValue(8, $singleUse, PDO::PARAM_BOOL);
-        $stmt->bindValue(9, self::fmt($now));
-        $stmt->execute();
-        /** @var array<string, mixed> $row */
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return new CreateShareResult(share: self::rowToShare($row), token: $token);
+            $stmt->bindValue(1, $shareUuid);
+            $stmt->bindValue(2, $tokenHash, PDO::PARAM_LOB);
+            $stmt->bindValue(3, $objectType);
+            $stmt->bindValue(4, self::objectIdToUuid($objectId));
+            $stmt->bindValue(5, $relation);
+            $stmt->bindValue(6, $createdByUuid);
+            $stmt->bindValue(7, self::fmt($expiresAt));
+            $stmt->bindValue(8, $singleUse, PDO::PARAM_BOOL);
+            $stmt->bindValue(9, self::fmt($now));
+            $stmt->execute();
+            /** @var array<string, mixed> $row */
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            return new CreateShareResult(share: self::rowToShare($row), token: $token);
+        });
     }
 
     public function getShare(string $shareId): Share
@@ -209,8 +311,7 @@ final class PostgresShareStore implements ShareStore
     public function verifyShareToken(string $token): VerifiedShare
     {
         $inputHash = self::hashTokenBytes($token);
-        $this->pdo->beginTransaction();
-        try {
+        return $this->tx(function () use ($inputHash) {
             $stmt = $this->pdo->prepare(
                 'SELECT ' . self::SHR_COLS . ' FROM shr
                  WHERE token_hash = ?
@@ -255,36 +356,30 @@ final class PostgresShareStore implements ShareStore
                     throw new ShareConsumedException();
                 }
             }
-            $this->pdo->commit();
             return new VerifiedShare(
                 shareId: Id::encode('shr', (string) $row['id']),
                 objectType: (string) $row['object_type'],
                 objectId: (string) $row['object_id'],
                 relation: (string) $row['relation'],
             );
-        } catch (\Throwable $e) {
-            try {
-                $this->pdo->rollBack();
-            } catch (\Throwable) {
-                // surface original
-            }
-            throw $e;
-        }
+        });
     }
 
     public function revokeShare(string $shareId): Share
     {
-        $stmt = $this->pdo->prepare(
-            'UPDATE shr SET revoked_at = COALESCE(revoked_at, ?)
-             WHERE id = ?
-             RETURNING ' . self::SHR_COLS,
-        );
-        $stmt->execute([self::fmt($this->now()), self::wireToUuid($shareId)]);
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        if ($row === false) {
-            throw new ShareNotFoundException("Share {$shareId} not found");
-        }
-        return self::rowToShare($row);
+        return $this->nested(function () use ($shareId) {
+            $stmt = $this->pdo->prepare(
+                'UPDATE shr SET revoked_at = COALESCE(revoked_at, ?)
+                 WHERE id = ?
+                 RETURNING ' . self::SHR_COLS,
+            );
+            $stmt->execute([self::fmt($this->now()), self::wireToUuid($shareId)]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row === false) {
+                throw new ShareNotFoundException("Share {$shareId} not found");
+            }
+            return self::rowToShare($row);
+        });
     }
 
     public function listSharesForObject(
