@@ -6,7 +6,7 @@ Authorization primitives for [Flametrench](https://flametrench.dev): relational 
 
 The PHP counterpart of [`@flametrench/authz`](https://github.com/flametrench/node/tree/main/packages/authz). Same shapes, same invariants, same test fixtures.
 
-**Status:** v0.2.0-rc.5 (release candidate). PHP 8.3+ required. Includes `ShareStore` ([ADR 0012](https://github.com/flametrench/spec/blob/main/decisions/0012-share-tokens.md)) and Postgres-backed adapters (`PostgresTupleStore`, `PostgresShareStore`). Per [ADR 0013](https://github.com/flametrench/spec/blob/main/decisions/0013-postgres-adapter-transaction-nesting.md) the Postgres adapters cooperate with adopter-side outer transactions via savepoints when nested.
+**Status:** v0.2.0 (stable). PHP 8.3+ required. Includes `ShareStore` ([ADR 0012](https://github.com/flametrench/spec/blob/main/decisions/0012-share-tokens.md)) and Postgres-backed adapters (`PostgresTupleStore`, `PostgresShareStore`). Per [ADR 0013](https://github.com/flametrench/spec/blob/main/decisions/0013-postgres-adapter-transaction-nesting.md) the Postgres adapters cooperate with adopter-side outer transactions via savepoints when nested.
 
 ## Install
 
