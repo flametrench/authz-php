@@ -123,10 +123,34 @@ final class PostgresShareStore implements ShareStore
         }
     }
 
-    /** Read the immediate caller of the function that called this helper. */
+    /**
+     * Read the immediate caller of the function that called this helper.
+     *
+     * security-audit-v0.3.md L2: skip private/protected frames so the
+     * savepoint name reflects the public API method adopters see in
+     * pg_stat_activity, not whichever internal helper happened to be
+     * the one that called nested().
+     */
     private static function callerName(): string
     {
-        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 12);
+        for ($i = 2; $i < count($bt); $i++) {
+            $frame = $bt[$i];
+            $fn = (string) ($frame['function'] ?? '');
+            if ($fn === '') continue;
+            $class = $frame['class'] ?? null;
+            if ($class === null) {
+                return $fn;
+            }
+            try {
+                $rm = new \ReflectionMethod($class, $fn);
+                if ($rm->isPublic()) {
+                    return $fn;
+                }
+            } catch (\ReflectionException) {
+                return $fn;
+            }
+        }
         return (string) ($bt[2]['function'] ?? 'tx');
     }
 
@@ -137,7 +161,8 @@ final class PostgresShareStore implements ShareStore
         if ($method === '') {
             $method = 'tx';
         }
-        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
+        // security-audit-v0.3.md L1: 8 bytes — see PostgresTupleStore.
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(8));
     }
 
     private static function fmt(\DateTimeImmutable $dt): string

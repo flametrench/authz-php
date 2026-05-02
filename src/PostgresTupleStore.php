@@ -107,10 +107,34 @@ final class PostgresTupleStore implements TupleStore
         }
     }
 
-    /** Read the immediate caller of the function that called this helper. */
+    /**
+     * Read the immediate caller of the function that called this helper.
+     *
+     * security-audit-v0.3.md L2: skip private/protected frames so the
+     * savepoint name reflects the public API method adopters see in
+     * pg_stat_activity, not whichever internal helper happened to be
+     * the one that called nested().
+     */
     private static function callerName(): string
     {
-        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 3);
+        $bt = \debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 12);
+        for ($i = 2; $i < count($bt); $i++) {
+            $frame = $bt[$i];
+            $fn = (string) ($frame['function'] ?? '');
+            if ($fn === '') continue;
+            $class = $frame['class'] ?? null;
+            if ($class === null) {
+                return $fn;
+            }
+            try {
+                $rm = new \ReflectionMethod($class, $fn);
+                if ($rm->isPublic()) {
+                    return $fn;
+                }
+            } catch (\ReflectionException) {
+                return $fn;
+            }
+        }
         return (string) ($bt[2]['function'] ?? 'tx');
     }
 
@@ -121,7 +145,11 @@ final class PostgresTupleStore implements TupleStore
         if ($method === '') {
             $method = 'tx';
         }
-        return 'ft_' . $method . '_' . bin2hex(random_bytes(4));
+        // security-audit-v0.3.md L1: 8 bytes = 64-bit suffix; the
+        // 4-byte form had a birthday collision floor at ~65k savepoints
+        // per connection, well above any real workload but cheap to
+        // raise to a 2^32 floor for free.
+        return 'ft_' . $method . '_' . bin2hex(random_bytes(8));
     }
 
     private static function wireToUuid(string $wireId): string
