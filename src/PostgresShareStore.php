@@ -239,7 +239,14 @@ final class PostgresShareStore implements ShareStore
         bool $singleUse = false,
     ): CreateShareResult {
         self::validate($relation, $objectType, $expiresInSeconds);
-        return $this->nested(function () use (
+        // security-audit-v0.3.md M3: createShare uses tx() (real
+        // BEGIN/COMMIT) not nested(). Standalone (no outer txn),
+        // nested() runs the closure unwrapped — the user-status
+        // SELECT and the share INSERT are not atomic. A race with
+        // revoke/suspend between them would mint a share for a
+        // no-longer-active user. tx() forces a transaction so the
+        // FOR UPDATE on the user row holds across the INSERT.
+        return $this->tx(function () use (
             $objectType,
             $objectId,
             $relation,

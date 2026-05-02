@@ -159,10 +159,24 @@ final class PostgresTupleStore implements TupleStore
      * any registered prefix (`org_<hex>` for `tuple_to_userset` parent
      * hops), or bare canonical UUID (passthrough). Mirrors
      * {@see objectIdToUuid}.
+     *
+     * security-audit-v0.3.md M9: when both arguments are passed and
+     * the subjectId carries a prefix, assert the prefix matches the
+     * declared subjectType. Without the assertion, an adopter that
+     * trusts subjectType from one source and subjectId from another
+     * (mismatched) loses the cross-check and silently strips the
+     * prefix.
      */
-    private static function subjectIdToUuid(string $subjectId): string
+    private static function subjectIdToUuid(string $subjectId, ?string $subjectType = null): string
     {
-        if (preg_match('/^[a-z]{2,6}_[0-9a-f]{32}$/', $subjectId) === 1) {
+        if (preg_match('/^([a-z]{2,6})_([0-9a-f]{32})$/', $subjectId, $m) === 1) {
+            $idPrefix = $m[1];
+            if ($subjectType !== null && $idPrefix !== $subjectType) {
+                throw new InvalidFormatException(
+                    "subjectId prefix '{$idPrefix}_' does not match subjectType '{$subjectType}'",
+                    'subject_id',
+                );
+            }
             return Id::decodeAny($subjectId)['uuid'];
         }
         return $subjectId;
@@ -225,7 +239,7 @@ final class PostgresTupleStore implements TupleStore
             $createdBy,
         ) {
             $id = Id::decode(Id::generate('tup'))['uuid'];
-            $subjectUuid = self::subjectIdToUuid($subjectId);
+            $subjectUuid = self::subjectIdToUuid($subjectId, $subjectType);
             $objectUuid = self::objectIdToUuid($objectId);
             $createdByUuid = $createdBy !== null ? self::wireToUuid($createdBy) : null;
             $now = $this->now()->format('Y-m-d H:i:s.uP');
@@ -288,7 +302,7 @@ final class PostgresTupleStore implements TupleStore
             $stmt = $this->pdo->prepare(
                 'DELETE FROM tup WHERE subject_type = ? AND subject_id = ?'
             );
-            $stmt->execute([$subjectType, self::subjectIdToUuid($subjectId)]);
+            $stmt->execute([$subjectType, self::subjectIdToUuid($subjectId, $subjectType)]);
             return $stmt->rowCount();
         });
     }
@@ -368,7 +382,7 @@ final class PostgresTupleStore implements TupleStore
             );
             $stmt->execute([
                 $subjectType,
-                self::subjectIdToUuid($subjectId),
+                self::subjectIdToUuid($subjectId, $subjectType),
                 '{' . implode(',', array_map(fn(string $r) => '"' . $r . '"', $relations)) . '}',
                 $objectType,
                 self::objectIdToUuid($objectId),
@@ -410,7 +424,7 @@ final class PostgresTupleStore implements TupleStore
         );
         $stmt->execute([
             $subjectType,
-            self::subjectIdToUuid($subjectId),
+            self::subjectIdToUuid($subjectId, $subjectType),
             $relation,
             $objectType,
             self::objectIdToUuid($objectId),
@@ -471,7 +485,7 @@ final class PostgresTupleStore implements TupleStore
         int $limit = 50,
     ): Page {
         $limit = min($limit, 200);
-        $params = [$subjectType, self::subjectIdToUuid($subjectId)];
+        $params = [$subjectType, self::subjectIdToUuid($subjectId, $subjectType)];
         $sql = 'SELECT id, subject_type, subject_id, relation, object_type, object_id, created_at, created_by
                 FROM tup
                 WHERE subject_type = ? AND subject_id = ?';
