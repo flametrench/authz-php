@@ -306,23 +306,5 @@ it('multiple SDK calls in one outer transaction commit-or-rollback together', fu
     expect($this->store->check('usr', $this->bob, 'viewer', 'proj', $this->project99)->allowed)->toBeFalse();
 });
 
-/**
- * Convert a postgres:// URL into a PDO connection. Accepts the same
- * forms as libpq (postgres://user:pass@host:port/db).
- */
-function pdoFromUrl(string $url): PDO
-{
-    $parts = parse_url($url);
-    if ($parts === false) {
-        throw new RuntimeException("invalid postgres URL: {$url}");
-    }
-    $host = $parts['host'] ?? '127.0.0.1';
-    $port = $parts['port'] ?? 5432;
-    $db = ltrim($parts['path'] ?? '/postgres', '/');
-    $user = $parts['user'] ?? 'postgres';
-    $pass = $parts['pass'] ?? '';
-    $dsn = "pgsql:host={$host};port={$port};dbname={$db}";
-    return new PDO($dsn, $user, $pass, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    ]);
-}
+// pdoFromUrl now lives in tests/Helpers.php so PostgresRewriteRulesTest
+// and other Postgres-backed test files can share it.

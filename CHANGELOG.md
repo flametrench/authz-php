@@ -3,6 +3,22 @@
 All notable changes to `flametrench/authz` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.3.0] — Unreleased
+
+### Added (Postgres rewrite-rule evaluation, ADR 0017)
+- `PostgresTupleStore` constructor accepts a new optional `$rules` parameter mirroring `InMemoryTupleStore`. With `$rules` unset (or `[]`), behavior is byte-identical to v0.2 (single SELECT with `relation = ANY($3)` short-circuits the `checkAny` fast path).
+- With `$rules` set, `check()` evaluates rewrite rules via iterative expansion against Postgres — same algorithm as `InMemoryTupleStore` (cycle detection, depth + fan-out bounds, short-circuit semantics from ADR 0007 unchanged).
+- New `$maxDepth` and `$maxFanOut` constructor parameters expose the same evaluation bounds as `InMemoryTupleStore`.
+- New private `subjectIdToUuid` helper accepts wire-format ids with any registered prefix (e.g. `org_<hex>`), not just `usr_<hex>`. Required for `tuple_to_userset` patterns where the parent hop is a non-`usr` object.
+- New `PostgresRewriteRulesTest` covers `computed_userset` chains, `tuple_to_userset` parent inheritance, cycle detection, depth limit, and `checkAny` fast-path / rules-path against the live Postgres adapter.
+
+### Test infrastructure
+- Test-vendored `postgres-schema.sql` re-synced from spec `reference/postgres.sql` to pick up the relaxed `tup.subject_type` constraint (now `^[a-z]{2,6}$` per ADR 0017 follow-up). The v0.1/v0.2 `subject_type IN ('usr')` constraint silently blocked `tuple_to_userset` patterns; lifting it is additive.
+- `pdoFromUrl()` extracted to `tests/Helpers.php` and loaded via `Pest.php` so multiple Postgres-backed test files share one DSN parser.
+
+### Required dependency bump
+- `flametrench/ids` constraint now `^0.3.0` to track the v0.3 family. The runtime doesn't require any new prefixes from ids-php (PAT lives on identity-php), but the bump keeps the dependency family aligned.
+
 ## [v0.2.0-rc.4] — 2026-04-27
 
 ### Fixed

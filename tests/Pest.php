@@ -5,4 +5,6 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/Helpers.php';
+
 pest()->extend(PHPUnit\Framework\TestCase::class)->in('./');
