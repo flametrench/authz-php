@@ -144,6 +144,49 @@ it('checkAny rejects an empty relation set', function () {
     );
 })->throws(EmptyRelationSetException::class);
 
+// security-audit-v0.3.md C1: relation injection via Postgres array literal.
+// Without input validation, a relation containing `","` becomes a literal
+// break in the array text, granting unrequested permissions.
+it('checkAny rejects a relation with embedded `","` (C1 array-literal injection)', function () {
+    // Set up: alice has admin (an authority she shouldn't get from a viewer check).
+    $this->store->createTuple(
+        subjectType: 'usr',
+        subjectId: $this->alice,
+        relation: 'admin',
+        objectType: 'proj',
+        objectId: $this->project42,
+    );
+    // Attack: ask for `viewer` only, but smuggle `admin` via the array-literal break.
+    // Pre-fix this would be parsed by Postgres as {"viewer","admin"} and match the admin tuple.
+    $this->store->checkAny(
+        subjectType: 'usr',
+        subjectId: $this->alice,
+        relations: ['viewer","admin'],
+        objectType: 'proj',
+        objectId: $this->project42,
+    );
+})->throws(InvalidFormatException::class);
+
+it('checkAny rejects a relation with `\\` or `"` characters', function () {
+    $this->store->checkAny(
+        subjectType: 'usr',
+        subjectId: $this->alice,
+        relations: ['"escape'],
+        objectType: 'proj',
+        objectId: $this->project42,
+    );
+})->throws(InvalidFormatException::class);
+
+it('checkAny rejects when ANY element of the set fails relation pattern (single bad apple)', function () {
+    $this->store->checkAny(
+        subjectType: 'usr',
+        subjectId: $this->alice,
+        relations: ['viewer', 'editor', 'has space'],
+        objectType: 'proj',
+        objectId: $this->project42,
+    );
+})->throws(InvalidFormatException::class);
+
 it('deleteTuple removes the row; subsequent check is false', function () {
     $t = $this->store->createTuple(
         subjectType: 'usr',

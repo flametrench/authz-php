@@ -340,6 +340,22 @@ final class PostgresTupleStore implements TupleStore
         if (count($relations) === 0) {
             throw new EmptyRelationSetException();
         }
+        // Security: every element of $relations is interpolated into a
+        // Postgres array literal below. We MUST reject any relation
+        // name that doesn't match the spec regex BEFORE binding —
+        // otherwise a relation containing `","` would be parsed by
+        // Postgres as a multi-element array, granting unrequested
+        // permissions (security-audit-v0.3.md C1). The regex
+        // `^[a-z_]{2,32}$` disallows quote / comma / backslash, which
+        // is exactly the safety property we need.
+        foreach ($relations as $relation) {
+            if (preg_match(Patterns::RELATION_NAME, $relation) !== 1) {
+                throw new InvalidFormatException(
+                    "relation '{$relation}' must match " . Patterns::RELATION_NAME,
+                    'relation',
+                );
+            }
+        }
         // Fast path: when no rules are registered, a single SELECT with
         // `relation = ANY($3)` short-circuits across the whole set in
         // one round trip — preserves v0.2 behavior.
