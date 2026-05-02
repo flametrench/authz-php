@@ -32,6 +32,18 @@ interface ShareStore
 
     public function getShare(string $shareId): Share;
 
+    /**
+     * @security The returned VerifiedShare->relation is the relation
+     * the share was minted with. The adopter MUST gate write paths
+     * on this — verifyShareToken only proves the token is valid, not
+     * that the bearer is allowed to perform the action. A common
+     * footgun (security-audit-v0.3.md C2): minting 'viewer' shares
+     * and using them on both read AND write endpoints without
+     * checking $verified->relation on the writes — the SDK will not
+     * stop a viewer share from posting comments. Mint distinct
+     * relations per intent; gate each endpoint accordingly. See
+     * spec/docs/shares.md §"Adopter MUST: enforce the relation field".
+     */
     public function verifyShareToken(string $token): VerifiedShare;
 
     /**
